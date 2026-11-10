@@ -2,9 +2,25 @@ use std::env;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::directories::PROJECT_DIRS;
+
+#[cfg(not(target_os = "windows"))]
+const DEFAULT_SYSTEM_CONFIG_PREFIX: &str = "/etc";
+
+#[cfg(target_os = "windows")]
+const DEFAULT_SYSTEM_CONFIG_PREFIX: &str = "C:\\ProgramData";
+
+pub fn system_config_file() -> PathBuf {
+    let folder = option_env!("BAT_SYSTEM_CONFIG_PREFIX").unwrap_or(DEFAULT_SYSTEM_CONFIG_PREFIX);
+    let mut path = PathBuf::from(folder);
+
+    path.push("bat");
+    path.push("config");
+
+    path
+}
 
 pub fn config_file() -> PathBuf {
     env::var("BAT_CONFIG_PATH")
@@ -16,12 +32,13 @@ pub fn config_file() -> PathBuf {
 pub fn generate_config_file() -> bat::error::Result<()> {
     let config_file = config_file();
     if config_file.is_file() {
-        println!(
+        writeln!(
+            io::stdout(),
             "A config file already exists at: {}",
             config_file.to_string_lossy()
-        );
+        )?;
 
-        print!("Overwrite? (y/N): ");
+        write!(io::stdout(), "Overwrite? (y/N): ")?;
         io::stdout().flush()?;
         let mut decision = String::new();
         io::stdin().read_line(&mut decision)?;
@@ -72,30 +89,57 @@ pub fn generate_config_file() -> bat::error::Result<()> {
 
     fs::write(&config_file, default_config).map_err(|e| {
         format!(
-            "Failed to create config file at '{}': {}",
+            "Failed to create config file at '{}': {e}",
             config_file.to_string_lossy(),
-            e
         )
     })?;
 
-    println!(
+    writeln!(
+        io::stdout(),
         "Success! Config file written to {}",
         config_file.to_string_lossy()
-    );
+    )?;
 
     Ok(())
 }
 
 pub fn get_args_from_config_file() -> Result<Vec<OsString>, shell_words::ParseError> {
-    Ok(fs::read_to_string(config_file())
-        .ok()
-        .map(|content| get_args_from_str(&content))
-        .transpose()?
-        .unwrap_or_else(Vec::new))
+    let mut config = String::new();
+
+    let system_config = system_config_file();
+    let user_config = config_file();
+
+    if let Ok(c) = fs::read_to_string(&system_config) {
+        config.push_str(strip_bom(&c));
+        config.push('\n');
+    }
+
+    // Skip the user config if it resolves to the same file as the system config,
+    // which can happen when BAT_CONFIG_DIR is set to e.g. "/etc/bat". See #3589.
+    if !same_file(&system_config, &user_config) {
+        if let Ok(c) = fs::read_to_string(&user_config) {
+            config.push_str(strip_bom(&c));
+        }
+    }
+
+    get_args_from_str(&config)
 }
 
-pub fn get_args_from_env_var() -> Option<Result<Vec<OsString>, shell_words::ParseError>> {
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
+pub fn get_args_from_env_opts_var() -> Option<Result<Vec<OsString>, shell_words::ParseError>> {
     env::var("BAT_OPTS").ok().map(|s| get_args_from_str(&s))
+}
+
+/// Editors on Windows (e.g. `Set-Content -Encoding UTF8` in Windows PowerShell)
+/// may prepend a UTF-8 byte order mark, which would otherwise end up in the first argument.
+fn strip_bom(content: &str) -> &str {
+    content.strip_prefix('\u{feff}').unwrap_or(content)
 }
 
 fn get_args_from_str(content: &str) -> Result<Vec<OsString>, shell_words::ParseError> {
@@ -104,7 +148,7 @@ fn get_args_from_str(content: &str) -> Result<Vec<OsString>, shell_words::ParseE
         .map(|line| line.trim())
         .filter(|line| !line.is_empty())
         .filter(|line| !line.starts_with('#'))
-        .map(|line| shell_words::split(line))
+        .map(shell_words::split)
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(args_per_line
@@ -112,6 +156,27 @@ fn get_args_from_str(content: &str) -> Result<Vec<OsString>, shell_words::ParseE
         .flatten()
         .map(|line| line.into())
         .collect())
+}
+
+pub fn get_args_from_env_vars() -> Vec<OsString> {
+    [
+        ("--tabs", "BAT_TABS"),
+        ("--terminal-width", "BAT_WIDTH"),
+        ("--theme", bat::theme::env::BAT_THEME),
+        ("--theme-dark", bat::theme::env::BAT_THEME_DARK),
+        ("--theme-light", bat::theme::env::BAT_THEME_LIGHT),
+        ("--pager", "BAT_PAGER"),
+        ("--paging", "BAT_PAGING"),
+        ("--style", "BAT_STYLE"),
+    ]
+    .iter()
+    .filter_map(|(flag, key)| {
+        env::var(key)
+            .ok()
+            .map(|var| [flag.to_string(), var].join("="))
+    })
+    .map(|a| a.into())
+    .collect()
 }
 
 #[test]
@@ -171,4 +236,41 @@ fn comments() {
         vec!["-p", "--style", "numbers,changes", "--color=always"],
         get_args_from_str(config).unwrap()
     );
+}
+
+#[test]
+fn same_file_identical_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("config");
+    fs::write(&file, "").unwrap();
+    assert!(same_file(&file, &file));
+}
+
+#[test]
+fn same_file_different_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a");
+    let b = dir.path().join("b");
+    fs::write(&a, "").unwrap();
+    fs::write(&b, "").unwrap();
+    assert!(!same_file(&a, &b));
+}
+
+#[test]
+fn same_file_nonexistent() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a");
+    let b = dir.path().join("b");
+    assert!(!same_file(&a, &b));
+}
+
+#[cfg(unix)]
+#[test]
+fn same_file_via_symlink() {
+    let dir = tempfile::tempdir().unwrap();
+    let original = dir.path().join("config");
+    let link = dir.path().join("link");
+    fs::write(&original, "").unwrap();
+    std::os::unix::fs::symlink(&original, &link).unwrap();
+    assert!(same_file(&original, &link));
 }

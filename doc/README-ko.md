@@ -13,7 +13,7 @@
   <a href="#사용자화">사용자화</a> •
   <a href="#프로젝트-목표와-대안들">프로젝트 목표와 대안들</a><br>
   [<a href="../README.md">English</a>]
-  [<a href="https://github.com/chinanf-boy/bat-zh">中文</a>]
+  [<a href="README-zh.md">中文</a>]
   [<a href="README-ja.md">日本語</a>]
   [한국어]
   [<a href="README-ru.md">Русский</a>]
@@ -163,7 +163,7 @@ git show v0.6.0:src/main.rs | bat -l rs
 볼 수 있습니다:
 ```bash
 batdiff() {
-    git diff --name-only --diff-filter=d | xargs bat --diff
+    git diff --name-only --relative --diff-filter=d -z | xargs -0 bat --diff
 }
 ```
 이것을 별도의 도구로 쓰고 싶다면
@@ -214,7 +214,7 @@ man 2 select
 
 ## 설치
 
-[![Packaging status](https://repology.org/badge/vertical-allrepos/bat-cat.svg)](https://repology.org/project/bat-cat/versions)
+[![Packaging status](https://repology.org/badge/vertical-allrepos/bat-cat.svg?columns=3&exclude_unsupported=1)](https://repology.org/project/bat-cat/versions)
 
 ### Ubuntu에서 (`apt` 사용)
 *... 그리고 다른 Debian 기반의 Linux 배포판들에서.*
@@ -222,7 +222,7 @@ man 2 select
 `bat`은 [Ubuntu](https://packages.ubuntu.com/eoan/bat)와
 [Debian](https://packages.debian.org/sid/bat) 패키지 배포 과정에 도입되는 중이며,
 Eoan 19.10 버전의 Ubuntu에서부터 제공됩니다.
-현재 Debain에서는 불안정한 "Sid" 브랜치에서만 `bat`이 제공됩니다.
+현재 Debian에서는 불안정한 "Sid" 브랜치에서만 `bat`이 제공됩니다.
 
 만약 충분히 최신 버전의 Ubuntu/Debian이 설치되어 있다면 간단히 다음을 실행하세요:
 
@@ -264,7 +264,7 @@ apk add bat
 ### Arch Linux에서
 
 공식 소스를 통해
-[`bat` 패키지](https://www.archlinux.org/packages/community/x86_64/bat/)를
+[`bat` 패키지](https://www.archlinux.org/packages/extra/x86_64/bat/)를
 설치할 수 있습니다:
 
 ```bash
@@ -416,7 +416,7 @@ scoop install bat
 
 ### 소스에서
 
-`bat`의 소스를 빌드하기 위해서는, Rust 1.46 이상이 필요합니다.
+`bat`의 소스를 빌드하기 위해서는, Rust 1.79.0 이상이 필요합니다.
 `cargo`를 이용해 전부 빌드할 수 있습니다:
 
 ```bash
@@ -461,11 +461,11 @@ bat --list-themes | fzf --preview="bat --theme={} --color=always /path/to/file"
 
 - `ansi`는 어떤 터미널에서도 무난하게 보입니다. 이는 3비트 색상을 사용합니다:
   검정, 빨강, 녹색, 노랑, 파랑, 마젠타, 시안, 하양.
-- `base16`은 [base16](https://github.com/chriskempson/base16) 터미널 테마를 위해
+- `base16`은 [base16](https://github.com/tinted-theming/home) 터미널 테마를 위해
   디자인되었습니다.
-  이는 [base16 스타일 가이드라인](https://github.com/chriskempson/base16/blob/master/styling.md)에
+  이는 [base16 스타일 가이드라인](https://github.com/tinted-theming/home/blob/main/styling.md)에
   따라 4비트 색상(3비트 색상에 밝은 변형 추가)을 사용합니다.
-- `base16-256`는 [base16-shell](https://github.com/chriskempson/base16-shell)을
+- `base16-256`는 [base16-shell](https://github.com/tinted-theming/base16-shell)을
   위해 디자인되었습니다.
   이는 16부터 21의 일부 밝은 색상을 8비트 색상으로 대치합니다.
   단지 256-색상 터미널을 쓰지만 base16-shell을 쓰지 않는다고 해서 이것을

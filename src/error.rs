@@ -2,11 +2,16 @@ use std::io::Write;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum Error {
     #[error(transparent)]
     Io(#[from] ::std::io::Error),
     #[error(transparent)]
-    SyntectError(#[from] ::syntect::LoadingError),
+    Fmt(#[from] ::std::fmt::Error),
+    #[error(transparent)]
+    SyntectError(#[from] ::syntect::Error),
+    #[error(transparent)]
+    SyntectLoadingError(#[from] ::syntect::LoadingError),
     #[error(transparent)]
     ParseIntError(#[from] ::std::num::ParseIntError),
     #[error(transparent)]
@@ -23,6 +28,15 @@ pub enum Error {
     InvalidPagerValueBat,
     #[error("{0}")]
     Msg(String),
+    #[cfg(feature = "paging")]
+    #[error(transparent)]
+    MinusError(#[from] ::minus::MinusError),
+    #[cfg(feature = "lessopen")]
+    #[error(transparent)]
+    VarError(#[from] ::std::env::VarError),
+    #[cfg(feature = "lessopen")]
+    #[error(transparent)]
+    CommandParseError(#[from] ::shell_words::ParseError),
 }
 
 impl From<&'static str> for Error {
@@ -39,8 +53,19 @@ impl From<String> for Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Paint a `[bat error]`/`[bat warning]` style prefix, unless the user asked
+/// for no colors by setting the `NO_COLOR` environment variable.
+#[doc(hidden)]
+pub fn paint_prefix(color: nu_ansi_term::Color, prefix: &str) -> String {
+    if std::env::var_os("NO_COLOR").is_some_and(|x| !x.is_empty()) {
+        prefix.to_owned()
+    } else {
+        color.paint(prefix).to_string()
+    }
+}
+
 pub fn default_error_handler(error: &Error, output: &mut dyn Write) {
-    use ansi_term::Colour::Red;
+    use nu_ansi_term::Color::Red;
 
     match error {
         Error::Io(ref io_error) if io_error.kind() == ::std::io::ErrorKind::BrokenPipe => {
@@ -49,14 +74,18 @@ pub fn default_error_handler(error: &Error, output: &mut dyn Write) {
         Error::SerdeYamlError(_) => {
             writeln!(
                 output,
-                "{}: Error while parsing metadata.yaml file: {}",
-                Red.paint("[bat error]"),
-                error
+                "{}: Error while parsing metadata.yaml file: {error}",
+                paint_prefix(Red, "[bat error]"),
             )
             .ok();
         }
         _ => {
-            writeln!(output, "{}: {}", Red.paint("[bat error]"), error).ok();
+            writeln!(
+                &mut std::io::stderr().lock(),
+                "{}: {error}",
+                paint_prefix(Red, "[bat error]"),
+            )
+            .ok();
         }
     };
 }

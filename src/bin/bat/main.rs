@@ -3,25 +3,32 @@
 mod app;
 mod assets;
 mod clap_app;
+#[cfg(feature = "application")]
+mod completions;
 mod config;
 mod directories;
 mod input;
 
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::io;
 use std::io::{BufReader, Write};
 use std::path::Path;
 use std::process;
 
-use ansi_term::Colour::Green;
-use ansi_term::Style;
+use bat::output::{OutputHandle, OutputType};
+use nu_ansi_term::Color::Green;
+use nu_ansi_term::Style;
 
 use crate::{
     app::App,
     config::{config_file, generate_config_file},
 };
 
-use assets::{assets_from_cache_or_binary, cache_dir, clear_assets, config_dir};
+#[cfg(feature = "bugreport")]
+use crate::config::system_config_file;
+
+use assets::{assets_from_cache_or_binary, clear_assets};
 use directories::PROJECT_DIRS;
 use globset::GlobMatcher;
 
@@ -31,61 +38,69 @@ use bat::{
     error::*,
     input::Input,
     style::{StyleComponent, StyleComponents},
+    theme::{default_theme, theme, ColorScheme, ThemeOptions},
     MappingTarget, PagingMode,
 };
 
 const THEME_PREVIEW_DATA: &[u8] = include_bytes!("../../../assets/theme_preview.rs");
 
 #[cfg(feature = "build-assets")]
-fn build_assets(matches: &clap::ArgMatches) -> Result<()> {
+fn build_assets(matches: &clap::ArgMatches, config_dir: &Path, cache_dir: &Path) -> Result<()> {
     let source_dir = matches
-        .value_of("source")
+        .get_one::<String>("source")
         .map(Path::new)
-        .unwrap_or_else(|| PROJECT_DIRS.config_dir());
-    let target_dir = matches
-        .value_of("target")
-        .map(Path::new)
-        .unwrap_or_else(|| PROJECT_DIRS.cache_dir());
+        .unwrap_or_else(|| config_dir);
 
-    let blank = matches.is_present("blank");
-
-    bat::assets::build(source_dir, !blank, target_dir, clap::crate_version!())
+    bat::assets::build(
+        source_dir,
+        !matches.get_flag("blank"),
+        matches.get_flag("acknowledgements"),
+        cache_dir,
+        clap::crate_version!(),
+    )
 }
 
-fn run_cache_subcommand(matches: &clap::ArgMatches) -> Result<()> {
-    if matches.is_present("build") {
+fn run_cache_subcommand(
+    matches: &clap::ArgMatches,
+    #[cfg(feature = "build-assets")] config_dir: &Path,
+    default_cache_dir: &Path,
+) -> Result<()> {
+    let cache_dir = matches
+        .get_one::<String>("target")
+        .map(Path::new)
+        .unwrap_or_else(|| default_cache_dir);
+
+    if matches.get_flag("build") {
         #[cfg(feature = "build-assets")]
-        build_assets(matches)?;
+        build_assets(matches, config_dir, cache_dir)?;
         #[cfg(not(feature = "build-assets"))]
-        println!("bat has been built without the 'build-assets' feature. The 'cache --build' option is not available.");
-    } else if matches.is_present("clear") {
-        clear_assets();
+        writeln!(io::stdout(), "bat has been built without the 'build-assets' feature. The 'cache --build' option is not available.")?;
+    } else if matches.get_flag("clear") {
+        clear_assets(cache_dir)?;
     }
 
     Ok(())
 }
 
-fn get_syntax_mapping_to_paths<'a>(
-    mappings: &[(GlobMatcher, MappingTarget<'a>)],
-) -> HashMap<&'a str, Vec<String>> {
+fn get_syntax_mapping_to_paths<'r, 't, I>(mappings: I) -> HashMap<&'t str, Vec<String>>
+where
+    I: IntoIterator<Item = (&'r GlobMatcher, &'r MappingTarget<'t>)>,
+    't: 'r, // target text outlives rule
+{
     let mut map = HashMap::new();
     for mapping in mappings {
-        match mapping {
-            (_, MappingTarget::MapToUnknown) => {}
-            (_, MappingTarget::MapExtensionToUnknown) => {}
-            (matcher, MappingTarget::MapTo(s)) => {
-                let globs = map.entry(*s).or_insert_with(Vec::new);
-                globs.push(matcher.glob().glob().into());
-            }
+        if let (matcher, MappingTarget::MapTo(s)) = mapping {
+            let globs = map.entry(*s).or_insert_with(Vec::new);
+            globs.push(matcher.glob().glob().into());
         }
     }
     map
 }
 
-pub fn get_languages(config: &Config) -> Result<String> {
+pub fn get_languages(config: &Config, config_dir: &Path, cache_dir: &Path) -> Result<String> {
     let mut result: String = String::new();
 
-    let assets = assets_from_cache_or_binary(config.use_custom_assets)?;
+    let assets = assets_from_cache_or_binary(config.use_custom_assets, config_dir, cache_dir)?;
     let mut languages = assets
         .get_syntaxes()?
         .iter()
@@ -114,7 +129,7 @@ pub fn get_languages(config: &Config) -> Result<String> {
 
     languages.sort_by_key(|lang| lang.name.to_uppercase());
 
-    let configured_languages = get_syntax_mapping_to_paths(config.syntax_mapping.mappings());
+    let configured_languages = get_syntax_mapping_to_paths(config.syntax_mapping.all_mappings());
 
     for lang in &mut languages {
         if let Some(additional_paths) = configured_languages.get(lang.name.as_str()) {
@@ -125,7 +140,7 @@ pub fn get_languages(config: &Config) -> Result<String> {
 
     if config.loop_through {
         for lang in languages {
-            result += &format!("{}:{}\n", lang.name, lang.file_extensions.join(","));
+            writeln!(result, "{}:{}", lang.name, lang.file_extensions.join(",")).ok();
         }
     } else {
         let longest = languages
@@ -137,7 +152,14 @@ pub fn get_languages(config: &Config) -> Result<String> {
         let comma_separator = ", ";
         let separator = " ";
         // Line-wrapping for the possible file extension overflow.
-        let desired_width = config.term_width - longest - separator.len();
+        // Clamp instead of subtracting: a tiny `--terminal-width` (smaller than the
+        // longest language name) would otherwise underflow `usize` and wrap to a huge
+        // value, silently disabling wrapping (and panicking in debug/overflow-checked
+        // builds). Mirrors the `saturating_sub` fix applied to `print_snip` in #3804.
+        let desired_width = config
+            .term_width
+            .saturating_sub(longest)
+            .saturating_sub(separator.len());
 
         let style = if config.colored_output {
             Green.normal()
@@ -146,7 +168,7 @@ pub fn get_languages(config: &Config) -> Result<String> {
         };
 
         for lang in languages {
-            result += &format!("{:width$}{}", lang.name, separator, width = longest);
+            write!(result, "{:width$}{separator}", lang.name, width = longest).ok();
 
             // Number of characters on this line so far, wrap before `desired_width`
             let mut num_chars = 0;
@@ -157,11 +179,11 @@ pub fn get_languages(config: &Config) -> Result<String> {
                 let new_chars = word.len() + comma_separator.len();
                 if num_chars + new_chars >= desired_width {
                     num_chars = 0;
-                    result += &format!("\n{:width$}{}", "", separator, width = longest);
+                    write!(result, "\n{:width$}{separator}", "", width = longest).ok();
                 }
 
                 num_chars += new_chars;
-                result += &format!("{}", style.paint(&word[..]));
+                write!(result, "{}", style.paint(&word[..])).ok();
                 if extension.peek().is_some() {
                     result += comma_separator;
                 }
@@ -177,83 +199,176 @@ fn theme_preview_file<'a>() -> Input<'a> {
     Input::from_reader(Box::new(BufReader::new(THEME_PREVIEW_DATA)))
 }
 
-pub fn list_themes(cfg: &Config) -> Result<()> {
-    let assets = assets_from_cache_or_binary(cfg.use_custom_assets)?;
+pub fn list_themes(
+    cfg: &Config,
+    config_dir: &Path,
+    cache_dir: &Path,
+    theme_options: ThemeOptions,
+) -> Result<()> {
+    let assets = assets_from_cache_or_binary(cfg.use_custom_assets, config_dir, cache_dir)?;
     let mut config = cfg.clone();
     let mut style = HashSet::new();
     style.insert(StyleComponent::Plain);
     config.language = Some("Rust");
     config.style_components = StyleComponents(style);
 
-    let stdout = io::stdout();
-    let mut stdout = stdout.lock();
+    let default_theme_name = theme(theme_options).to_string();
+    let mut buf = String::new();
+    let mut handle = OutputHandle::FmtWrite(&mut buf);
 
-    if config.colored_output {
-        for theme in assets.themes() {
-            writeln!(
-                stdout,
-                "Theme: {}\n",
-                Style::new().bold().paint(theme.to_string())
-            )?;
+    for theme in assets.themes() {
+        let default_theme_info = if default_theme_name == theme {
+            " (default)"
+        } else if default_theme(ColorScheme::Dark) == theme {
+            " (default dark)"
+        } else if default_theme(ColorScheme::Light) == theme {
+            " (default light)"
+        } else {
+            ""
+        };
+
+        if config.colored_output {
+            handle.write_fmt(format_args!(
+                "{}{default_theme_info}\n\n",
+                Style::new().bold().paint(theme.to_string()),
+            ))?;
             config.theme = theme.to_string();
             Controller::new(&config, &assets)
-                .run(vec![theme_preview_file()])
+                .run(vec![theme_preview_file()], Some(&mut handle))
                 .ok();
-            writeln!(stdout)?;
+            handle.write_fmt(format_args!("\n"))?;
+        } else if config.loop_through {
+            handle.write_fmt(format_args!("{theme}\n"))?;
+        } else {
+            handle.write_fmt(format_args!("{theme}{default_theme_info}\n"))?;
         }
-        writeln!(
-            stdout,
+    }
+
+    if config.colored_output {
+        handle.write_fmt(format_args!(
             "Further themes can be installed to '{}', \
             and are added to the cache with `bat cache --build`. \
             For more information, see:\n\n  \
             https://github.com/sharkdp/bat#adding-new-themes",
-            PROJECT_DIRS.config_dir().join("themes").to_string_lossy()
-        )?;
-    } else {
-        for theme in assets.themes() {
-            writeln!(stdout, "{}", theme)?;
-        }
+            config_dir.join("themes").to_string_lossy()
+        ))?;
     }
+
+    let mut output_type =
+        OutputType::from_mode(config.paging_mode, config.wrapping_mode, config.pager)?;
+    let mut writer = output_type.handle()?;
+    writer.write_fmt(format_args!("{buf}"))?;
 
     Ok(())
 }
 
-fn run_controller(inputs: Vec<Input>, config: &Config) -> Result<bool> {
-    let assets = assets_from_cache_or_binary(config.use_custom_assets)?;
+fn set_terminal_title_to(new_terminal_title: String) -> Result<()> {
+    let osc_command_for_setting_terminal_title = "\x1b]0;";
+    let osc_end_command = "\x07";
+    // Prevent BEL/ESC/C1 bytes in the title from terminating or nesting the OSC.
+    let safe_title = bat::sanitize_for_terminal(&new_terminal_title);
+    write!(
+        io::stdout(),
+        "{osc_command_for_setting_terminal_title}{safe_title}{osc_end_command}"
+    )?;
+    io::stdout().flush()?;
+    Ok(())
+}
+
+fn get_new_terminal_title(inputs: &Vec<Input>) -> String {
+    let mut new_terminal_title = "bat: ".to_string();
+    for (index, input) in inputs.iter().enumerate() {
+        new_terminal_title += input.description().title();
+        if index < inputs.len() - 1 {
+            new_terminal_title += ", ";
+        }
+    }
+    new_terminal_title
+}
+
+fn run_controller(
+    inputs: Vec<Input>,
+    config: &Config,
+    config_dir: &Path,
+    cache_dir: &Path,
+) -> Result<bool> {
+    let assets = assets_from_cache_or_binary(config.use_custom_assets, config_dir, cache_dir)?;
     let controller = Controller::new(config, &assets);
-    controller.run(inputs)
+    if config.paging_mode != PagingMode::Never && config.set_terminal_title {
+        set_terminal_title_to(get_new_terminal_title(&inputs))?;
+    }
+    controller.run(inputs, None)
 }
 
 #[cfg(feature = "bugreport")]
-fn invoke_bugreport(app: &App) {
-    use bugreport::{bugreport, collector::*, format::Markdown};
-    let pager = bat::config::get_pager_executable(app.matches.value_of("pager"))
-        .unwrap_or_else(|| "less".to_owned()); // FIXME: Avoid non-canonical path to "less".
+fn invoke_bugreport(app: &App, cache_dir: &Path) -> Result<()> {
+    use bugreport::{bugreport, collector::*, format::Markdown, report::ReportEntry};
+
+    struct ColorSchemeCollector;
+
+    impl Collector for ColorSchemeCollector {
+        fn description(&self) -> &str {
+            "Detected terminal color scheme"
+        }
+
+        fn collect(
+            &mut self,
+            _: &bugreport::CrateInfo,
+        ) -> std::result::Result<ReportEntry, CollectionError> {
+            let color_scheme = bat::theme::color_scheme(bat::theme::DetectColorScheme::Always);
+            let text = match color_scheme {
+                Some(bat::theme::ColorScheme::Dark) => "dark",
+                Some(bat::theme::ColorScheme::Light) => "light",
+                None => "not detected",
+            };
+            Ok(ReportEntry::Text(text.to_string()))
+        }
+    }
+    let pager = bat::config::get_pager_executable(
+        app.matches.get_one::<String>("pager").map(|s| s.as_str()),
+    )
+    .unwrap_or_else(|| "less".to_owned()); // FIXME: Avoid non-canonical path to "less".
+
+    let mut custom_assets_metadata = cache_dir.to_path_buf();
+    custom_assets_metadata.push("metadata.yaml");
 
     let mut report = bugreport!()
         .info(SoftwareVersion::default())
         .info(OperatingSystem::default())
         .info(CommandLine::default())
         .info(EnvironmentVariables::list(&[
-            "SHELL",
-            "PAGER",
-            "LESS",
-            "LANG",
-            "LC_ALL",
-            "BAT_PAGER",
             "BAT_CACHE_PATH",
+            "BAT_CONFIG_DIR",
             "BAT_CONFIG_PATH",
             "BAT_OPTS",
+            "BAT_PAGER",
+            "BAT_PAGING",
             "BAT_STYLE",
             "BAT_TABS",
             "BAT_THEME",
-            "XDG_CONFIG_HOME",
-            "XDG_CACHE_HOME",
+            "BAT_WIDTH",
+            bat::theme::env::BAT_THEME_DARK,
+            bat::theme::env::BAT_THEME_LIGHT,
             "COLORTERM",
-            "NO_COLOR",
+            "LANG",
+            "LC_ALL",
+            "LESS",
             "MANPAGER",
+            "NO_COLOR",
+            "PAGER",
+            "SHELL",
+            "TERM",
+            "XDG_CACHE_HOME",
+            "XDG_CONFIG_HOME",
         ]))
+        .info(FileContent::new("System Config file", system_config_file()))
         .info(FileContent::new("Config file", config_file()))
+        .info(FileContent::new(
+            "Custom assets metadata",
+            custom_assets_metadata,
+        ))
+        .info(DirectoryEntries::new("Custom assets", cache_dir))
+        .info(ColorSchemeCollector)
         .info(CompileTimeInformation::default());
 
     #[cfg(feature = "paging")]
@@ -265,67 +380,89 @@ fn invoke_bugreport(app: &App) {
         ))
     };
 
-    report.print::<Markdown>();
+    writeln!(io::stdout(), "{}", report.format::<Markdown>())?;
+    Ok(())
 }
 
 /// Returns `Err(..)` upon fatal errors. Otherwise, returns `Ok(true)` on full success and
 /// `Ok(false)` if any intermediate errors occurred (were printed).
 fn run() -> Result<bool> {
     let app = App::new()?;
+    let config_dir = PROJECT_DIRS.config_dir();
+    let cache_dir = PROJECT_DIRS.cache_dir();
 
-    if app.matches.is_present("diagnostic") {
+    if app.matches.get_flag("diagnostic") {
         #[cfg(feature = "bugreport")]
-        invoke_bugreport(&app);
+        invoke_bugreport(&app, cache_dir)?;
         #[cfg(not(feature = "bugreport"))]
-        println!("bat has been built without the 'bugreport' feature. The '--diagnostic' option is not available.");
+        writeln!(io::stdout(), "bat has been built without the 'bugreport' feature. The '--diagnostic' option is not available.")?;
+        return Ok(true);
+    }
+
+    #[cfg(feature = "application")]
+    if let Some(shell) = app.matches.get_one::<String>("completion") {
+        let completion = match shell.as_str() {
+            "bash" => completions::BASH_COMPLETION,
+            "fish" => completions::FISH_COMPLETION,
+            "ps1" => completions::PS1_COMPLETION,
+            "zsh" => completions::ZSH_COMPLETION,
+            _ => unreachable!("No completion for shell '{shell}' available."),
+        };
+        writeln!(io::stdout(), "{completion}")?;
         return Ok(true);
     }
 
     match app.matches.subcommand() {
-        ("cache", Some(cache_matches)) => {
+        Some(("cache", cache_matches)) => {
             // If there is a file named 'cache' in the current working directory,
             // arguments for subcommand 'cache' are not mandatory.
             // If there are non-zero arguments, execute the subcommand cache, else, open the file cache.
-            if !cache_matches.args.is_empty() {
-                run_cache_subcommand(cache_matches)?;
+            if cache_matches.args_present() {
+                run_cache_subcommand(
+                    cache_matches,
+                    #[cfg(feature = "build-assets")]
+                    config_dir,
+                    cache_dir,
+                )?;
                 Ok(true)
             } else {
                 let inputs = vec![Input::ordinary_file("cache")];
                 let config = app.config(&inputs)?;
 
-                run_controller(inputs, &config)
+                run_controller(inputs, &config, config_dir, cache_dir)
             }
         }
         _ => {
             let inputs = app.inputs()?;
             let config = app.config(&inputs)?;
 
-            if app.matches.is_present("list-languages") {
-                let languages: String = get_languages(&config)?;
+            if app.matches.get_flag("list-languages") {
+                let languages: String = get_languages(&config, config_dir, cache_dir)?;
                 let inputs: Vec<Input> = vec![Input::from_reader(Box::new(languages.as_bytes()))];
-                let plain_config = Config {
-                    style_components: StyleComponents::new(StyleComponent::Plain.components(false)),
-                    paging_mode: PagingMode::QuitIfOneScreen,
-                    ..Default::default()
-                };
-                run_controller(inputs, &plain_config)
-            } else if app.matches.is_present("list-themes") {
-                list_themes(&config)?;
+                let mut plain_config = config.clone();
+                plain_config.style_components =
+                    StyleComponents::new(StyleComponent::Plain.components(false));
+                run_controller(inputs, &plain_config, config_dir, cache_dir)
+            } else if app.matches.get_flag("list-themes") {
+                list_themes(&config, config_dir, cache_dir, app.theme_options())?;
                 Ok(true)
-            } else if app.matches.is_present("config-file") {
-                println!("{}", config_file().to_string_lossy());
+            } else if app.matches.get_flag("config-file") {
+                writeln!(io::stdout(), "{}", config_file().to_string_lossy())?;
                 Ok(true)
-            } else if app.matches.is_present("generate-config-file") {
+            } else if app.matches.get_flag("generate-config-file") {
                 generate_config_file()?;
                 Ok(true)
-            } else if app.matches.is_present("config-dir") {
-                writeln!(io::stdout(), "{}", config_dir())?;
+            } else if app.matches.get_flag("config-dir") {
+                writeln!(io::stdout(), "{}", config_dir.to_string_lossy())?;
                 Ok(true)
-            } else if app.matches.is_present("cache-dir") {
-                writeln!(io::stdout(), "{}", cache_dir())?;
+            } else if app.matches.get_flag("cache-dir") {
+                writeln!(io::stdout(), "{}", cache_dir.to_string_lossy())?;
+                Ok(true)
+            } else if app.matches.get_flag("acknowledgements") {
+                writeln!(io::stdout(), "{}", bat::assets::get_acknowledgements())?;
                 Ok(true)
             } else {
-                run_controller(inputs, &config)
+                run_controller(inputs, &config, config_dir, cache_dir)
             }
         }
     }

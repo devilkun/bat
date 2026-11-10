@@ -14,6 +14,10 @@ fn all_themes_are_present() {
         themes,
         vec![
             "1337",
+            "Catppuccin Frappe",
+            "Catppuccin Latte",
+            "Catppuccin Macchiato",
+            "Catppuccin Mocha",
             "Coldark-Cold",
             "Coldark-Dark",
             "DarkNeon",
@@ -30,7 +34,6 @@ fn all_themes_are_present() {
             "Solarized (light)",
             "Sublime Snazzy",
             "TwoDark",
-            "Visual Studio Dark+",
             "ansi",
             "base16",
             "base16-256",
